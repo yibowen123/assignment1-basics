@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from collections import Counter
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+import regex as re
+
 
 
 def run_linear(
@@ -561,6 +565,87 @@ def get_tokenizer(
     """
     raise NotImplementedError
 
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
+
+
+
+from collections import Counter, defaultdict
+
+
+def count_pairs(word):
+    """Count adjacent pair occurrences, including overlapping occurrences."""
+    return Counter(zip(word, word[1:]))
+
+
+def merge_word(word, pair):
+    """Apply a pair merge left to right, without overlapping merges."""
+    left, right = pair
+    merged = left + right
+
+    result = []
+    i = 0
+
+    while i < len(word):
+        if (
+            i + 1 < len(word)
+            and word[i] == left
+            and word[i + 1] == right
+        ):
+            result.append(merged)
+            i += 2
+        else:
+            result.append(word[i])
+            i += 1
+
+    return tuple(result)
+
+
+
 
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -589,4 +674,200 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    special_tokens = list(dict.fromkeys(special_tokens))
+    
+    if any(token == "" for token in special_tokens):
+        raise ValueError("Special tokens must not be empty.")
+
+    if vocab_size < 256 + len(special_tokens):
+        raise ValueError(
+            "vocab_size must cover all 256 bytes and the special tokens."
+        )
+
+    PAT = re.compile(
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    )
+
+   
+    # vocab = {i: bytes([i]) for i in range(256)}
+
+    # Special tokens first.
+    vocab = {
+        i: token.encode("utf-8")
+        for i, token in enumerate(special_tokens)
+    }
+
+    # Printable ASCII: ! through ~.
+    byte_order = list(range(33, 127))
+
+    # Include every remaining byte, including spaces and control bytes.
+    byte_order += [b for b in range(256) if b not in byte_order]
+
+    for byte in byte_order:
+        vocab[len(vocab)] = bytes([byte])
+
+    # for token in special_tokens:
+    #     vocab[len(vocab)] = token.encode("utf-8")
+
+    special_pattern = (
+        re.compile(
+            "|".join(
+                re.escape(token)
+                for token in sorted(special_tokens, key=len, reverse=True)
+            )
+        )
+        if special_tokens else None
+    )
+
+    # 2. Count pre-tokens across ALL chunks.
+    pretoken_counts = Counter()
+
+    with open(input_path, "rb") as f:
+        num_processes = 4
+
+        boundaries = find_chunk_boundaries(
+            f,
+            num_processes,
+            b"<|endoftext|>",
+        )
+  
+
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk = f.read(end - start).decode("utf-8")
+
+            pieces = (
+                special_pattern.split(chunk)
+            )
+
+            for piece in pieces:
+                for match in PAT.finditer(piece):
+                    pretoken = match.group().encode("utf-8")
+                    pretoken_counts[pretoken] += 1
+
+
+    # word_counts = Counter()
+
+    # for pretoken, frequency in pretoken_counts.items():
+    #     word = tuple(bytes([byte]) for byte in pretoken)
+    #     word_counts[word] += frequency
+
+    # merges = []
+
+    # while len(vocab) < vocab_size:
+    #     pair_counts = Counter()
+
+    #     for word, frequency in word_counts.items():
+    #         for pair in zip(word[:-1], word[1:]):
+    #             pair_counts[pair] += frequency
+
+    #     if not pair_counts:
+    #         break
+
+    #     best_pair = max(
+    #         pair_counts,
+    #         key=lambda pair: (pair_counts[pair], pair),
+    #     )
+
+    #     left, right = best_pair
+    #     merged_token = left + right
+
+    #     merges.append(best_pair)
+    #     vocab[len(vocab)] = merged_token
+
+    #     updated_word_counts = Counter()
+
+    #     for word, frequency in word_counts.items():
+    #         updated_word = []
+    #         i = 0
+
+    #         while i < len(word):
+    #             if (
+    #                 i + 1 < len(word)
+    #                 and word[i] == left
+    #                 and word[i + 1] == right
+    #             ):
+    #                 updated_word.append(merged_token)
+    #                 i += 2
+    #             else:
+    #                 updated_word.append(word[i])
+    #                 i += 1
+
+    #         updated_word_counts[tuple(updated_word)] += frequency
+
+    #     word_counts = updated_word_counts
+
+    # return vocab, merges
+        # Reuse the 256 single-byte objects.
+    byte_tokens = tuple(bytes([i]) for i in range(256))
+
+    # Give each unique pre-token a stable word ID.
+    words = []
+    frequencies = []
+
+    for pretoken, frequency in pretoken_counts.items():
+        words.append(tuple(byte_tokens[b] for b in pretoken))
+        frequencies.append(frequency)
+
+    pair_counts = Counter()
+    pair_to_words = defaultdict(set)
+
+    # Build global counts and the inverted index once.
+    for word_id, word in enumerate(words):
+        frequency = frequencies[word_id]
+
+        for pair, occurrences in count_pairs(word).items():
+            pair_counts[pair] += occurrences * frequency
+            pair_to_words[pair].add(word_id)
+
+    merges = []
+
+    while len(vocab) < vocab_size and pair_counts:
+        # Preserve the original tie-breaking rule.
+        best_pair = max(
+            pair_counts,
+            key=lambda pair: (pair_counts[pair], pair),
+        )
+
+        merges.append(best_pair)
+        vocab[len(vocab)] = best_pair[0] + best_pair[1]
+
+        # Snapshot because the index changes during updates.
+        affected_word_ids = tuple(pair_to_words[best_pair])
+
+        for word_id in affected_word_ids:
+            old_word = words[word_id]
+            new_word = merge_word(old_word, best_pair)
+            frequency = frequencies[word_id]
+
+            old_pairs = count_pairs(old_word)
+            new_pairs = count_pairs(new_word)
+
+            # Update only pair types present before or after this merge.
+            for pair in old_pairs.keys() | new_pairs.keys():
+                old_count = old_pairs[pair]
+                new_count = new_pairs[pair]
+
+                delta = (new_count - old_count) * frequency
+
+                if delta:
+                    pair_counts[pair] += delta
+
+                    if pair_counts[pair] == 0:
+                        del pair_counts[pair]
+
+                # Maintain word membership independently of frequency.
+                if old_count and not new_count:
+                    members = pair_to_words[pair]
+                    members.remove(word_id)
+
+                    if not members:
+                        del pair_to_words[pair]
+
+                elif new_count and not old_count:
+                    pair_to_words[pair].add(word_id)
+
+            words[word_id] = new_word
+
+    return vocab, merges
